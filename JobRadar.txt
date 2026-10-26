@@ -1,0 +1,533 @@
+"""JobRadar: kleine, quellenübergreifende Streamlit-Jobsuche (MVP).
+
+Datenquellen:
+- BA Jobsuche, inoffizieller und veränderlicher Endpunkt
+- Arbeitnow, öffentliche API
+- Adzuna, optional mit API-Schlüsseln in Streamlit Secrets
+
+Für persönliche Nutzung. SQLite-Daten in Streamlit Community Cloud sind NICHT dauerhaft.
+Regelmäßig JSON-Backups herunterladen.
+"""
+
+import hashlib
+import hmac
+from contextlib import contextmanager
+import html
+import json
+import re
+import sqlite3
+import unicodedata
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote
+
+import requests
+import streamlit as st
+
+st.set_page_config(page_title="JobRadar", page_icon="🔎", layout="wide")
+
+DB_PATH = Path("jobradar.sqlite3")
+BA_URL = "https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/pc/v4/app/jobs"
+ARBEITNOW_URL = "https://www.arbeitnow.com/api/job-board-api"
+STATUS_VALUES = ["Neu", "Merkliste", "Beworben", "Abgelegt", "Absage"]
+CLOSED = {"Beworben", "Abgelegt", "Absage"}
+HEADERS = {"User-Agent": "JobRadar-Demo/1.0 (persoenliche Jobsuche)"}
+
+
+def timestamp():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def normalized(value):
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = text.casefold().replace("ß", "ss")
+    return re.sub(r"[^a-z0-9]+", " ", text).strip()
+
+
+def readable_html(value):
+    return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", str(value or "")))).strip()
+
+
+def clean_url(value):
+    url = str(value or "").strip()
+    if url.startswith("https://") or url.startswith("http://"):
+        return url
+    return ""
+
+
+def fingerprint(job):
+    # Quellenübergreifend stabil, solange Titel, Arbeitgeber und Ort weitgehend gleich bleiben.
+    # Nicht perfekt: abweichende Schreibweisen werden teilweise doppelt erscheinen.
+    parts = [normalized(job.get(field, "")) for field in ("title", "company", "location")]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:24]
+
+
+def make_job(title, company, location, url, source, description="", remote=False, remote_note="", date=""):
+    job = {
+        "title": str(title or "Unbekannte Stelle").strip(),
+        "company": str(company or "Arbeitgeber nicht genannt").strip(),
+        "location": str(location or "Ort unbekannt").strip(),
+        "url": clean_url(url),
+        "source": source,
+        "description": readable_html(description)[:1500],
+        "remote": bool(remote),
+        "remote_note": str(remote_note),
+        "date": str(date or ""),
+    }
+    job["key"] = fingerprint(job)
+    return job
+
+
+@contextmanager
+def db_connection():
+    connection = sqlite3.connect(DB_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+def init_db():
+    with db_connection() as conn:
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS jobs (
+                key TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                company TEXT NOT NULL,
+                location TEXT NOT NULL,
+                url TEXT,
+                source TEXT,
+                status TEXT NOT NULL DEFAULT 'Neu',
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL
+            )"""
+        )
+        conn.commit()
+
+
+def get_all():
+    with db_connection() as conn:
+        return [dict(row) for row in conn.execute("SELECT * FROM jobs ORDER BY first_seen DESC")]
+
+
+def save_jobs(jobs):
+    before = {r["key"] for r in get_all()}
+    now = timestamp()
+    with db_connection() as conn:
+        for job in jobs:
+            conn.execute(
+                """INSERT INTO jobs(key,title,company,location,url,source,status,first_seen,last_seen)
+                   VALUES (?,?,?,?,?,?, 'Neu',?,?)
+                   ON CONFLICT(key) DO UPDATE SET
+                     title=excluded.title, company=excluded.company,
+                     location=excluded.location,
+                     url=CASE WHEN excluded.url!='' THEN excluded.url ELSE jobs.url END,
+                     source=excluded.source, last_seen=excluded.last_seen""",
+                (job["key"], job["title"], job["company"], job["location"],
+                 job["url"], job["source"], now, now),
+            )
+        conn.commit()
+    return {job["key"] for job in jobs if job["key"] not in before}
+
+
+def set_status(key, value):
+    if value not in STATUS_VALUES:
+        return
+    with db_connection() as conn:
+        conn.execute("UPDATE jobs SET status=? WHERE key=?", (value, key))
+        conn.commit()
+
+
+def export_backup():
+    return json.dumps({"format": "jobradar-backup-v1", "created": timestamp(), "jobs": get_all()},
+                      ensure_ascii=False, indent=2).encode("utf-8")
+
+
+def restore_backup(raw):
+    data = json.loads(raw)
+    if not isinstance(data, dict) or data.get("format") != "jobradar-backup-v1":
+        raise ValueError("Keine gültige JobRadar-Backup-Datei.")
+    records = data.get("jobs")
+    if not isinstance(records, list) or len(records) > 10000:
+        raise ValueError("Unzulässiges Backup.")
+    count = 0
+    with db_connection() as conn:
+        for row in records:
+            if not isinstance(row, dict) or row.get("status") not in STATUS_VALUES:
+                continue
+            if not all(row.get(k) for k in ("key", "title", "first_seen")):
+                continue
+            conn.execute(
+                """INSERT INTO jobs(key,title,company,location,url,source,status,first_seen,last_seen)
+                   VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET
+                   status=excluded.status,
+                   first_seen=excluded.first_seen,
+                   last_seen=excluded.last_seen""",
+                (str(row["key"])[:80], str(row["title"])[:300],
+                 str(row.get("company", ""))[:300], str(row.get("location", ""))[:200],
+                 clean_url(row.get("url", "")), str(row.get("source", ""))[:100],
+                 row["status"], str(row["first_seen"])[:50],
+                 str(row.get("last_seen", row["first_seen"]))[:50]),
+            )
+            count += 1
+        conn.commit()
+    return count
+
+
+def api_get(url, *, params=None, headers=None):
+    response = requests.get(url, params=params, headers=headers or HEADERS, timeout=(6, 18))
+    response.raise_for_status()
+    return response.json()
+
+
+def search_ba(term, place, radius, homeoffice=False):
+    # Technisch nutzbarer, aber ausdrücklich NICHT offizieller und nicht garantierter Zugang.
+    params = {"was": term, "angebotsart": 1, "page": 1, "size": 35}
+    if homeoffice:
+        params["arbeitszeit"] = "ho"
+    else:
+        params.update({"wo": place, "umkreis": radius})
+    response = api_get(BA_URL, params=params,
+                       headers={**HEADERS, "X-API-Key": "jobboerse-jobsuche"})
+    listings = response.get("stellenangebote", [])
+    if not isinstance(listings, list):
+        return []
+    output = []
+    for item in listings:
+        location = item.get("arbeitsort") or {}
+        if not isinstance(location, dict):
+            location = {}
+        ref = item.get("refnr") or item.get("referenznummer") or ""
+        external = clean_url(item.get("externeUrl"))
+        url = external or (f"https://www.arbeitsagentur.de/jobsuche/jobdetail/{quote(ref)}" if ref else "")
+        output.append(make_job(
+            title=item.get("beruf") or item.get("stellenangebotsTitel"),
+            company=item.get("arbeitgeber"),
+            location=location.get("ort") or item.get("arbeitsortText") or "Deutschland",
+            url=url, source="Arbeitsagentur (inoffizielle API)",
+            remote=homeoffice,
+            remote_note="Heim-/Telearbeit laut Suchfilter; Umfang nicht geprüft" if homeoffice else "",
+            date=item.get("aktuelleVeroeffentlichungsdatum") or "",
+        ))
+    return output
+
+
+def search_arbeitnow(terms, place, nearby_cities, include_remote):
+    # Arbeitnow bietet in der freien API KEINEN Beruf- oder Umkreisfilter.
+    cities = [normalized(c) for c in [place] + nearby_cities if normalized(c)]
+    words = [normalized(term) for term in terms if normalized(term)]
+    output = []
+    for page in (1, 2): # bewusst begrenzter Ausschnitt der Jobdatenbank
+        response = api_get(ARBEITNOW_URL, params={"page": page})
+        listings = response.get("data", [])
+        if not isinstance(listings, list):
+            break
+        for item in listings:
+            title = str(item.get("title") or "")
+            tags = " ".join(map(str, item.get("tags") or []))
+            searchable = normalized(title + " " + tags)
+            if not any(term in searchable or any(w in searchable for w in term.split() if len(w) >= 5)
+                       for term in words):
+                continue
+            loc = str(item.get("location") or "")
+            is_remote = bool(item.get("remote"))
+            loc_norm = normalized(loc)
+            local_match = any(c in loc_norm for c in cities)
+            # Remote kann weltweit bedeuten. Region muss separat geprüft werden.
+            remote_match = include_remote and is_remote and (
+                "germany" in loc_norm or "deutschland" in loc_norm
+                or "remote" in loc_norm or "" == loc_norm
+            )
+            if not local_match and not remote_match:
+                continue
+            output.append(make_job(
+                title=title, company=item.get("company_name"), location=loc,
+                url=item.get("url"), source="Arbeitnow",
+                description=item.get("description", ""), remote=is_remote,
+                remote_note="Remote-Eignung für Deutschland und Anteil manuell prüfen" if is_remote else "Ort gefiltert, Luftlinienradius nicht geprüft",
+                date=item.get("created_at", ""),
+            ))
+        if not response.get("links", {}).get("next"):
+            break
+    return output
+
+
+def secret(name):
+    try:
+        return str(st.secrets.get(name, "")).strip()
+    except Exception:
+        return ""
+
+
+def search_adzuna(term, place, radius, app_id, app_key):
+    # Offizielle API; Zugriff erfordert persönliche API-Zugangsdaten.
+    response = api_get("https://api.adzuna.com/v1/api/jobs/de/search/1", params={
+        "app_id": app_id, "app_key": app_key,
+        "what": term, "where": place,
+        "distance": radius, "results_per_page": 35,
+        "sort_by": "date", "content-type": "application/json"
+    })
+    output = []
+    for item in response.get("results", []):
+        company = item.get("company") or {}
+        location = item.get("location") or {}
+        output.append(make_job(
+            title=item.get("title"), company=company.get("display_name"),
+            location=location.get("display_name"),
+            url=item.get("redirect_url"), source="Adzuna",
+            description=item.get("description", ""), date=item.get("created", ""),
+        ))
+    return output
+
+
+def search_all(terms, place, radius, include_remote, nearby, use_ba, use_arbeitnow, use_adzuna):
+    all_jobs = []
+    reports = []
+    # Einzelne Quellen dürfen fehlschlagen, ohne die gesamte Suche zu stoppen.
+    if use_ba:
+        collected = 0
+        failures = []
+        for term in terms:
+            try:
+                items = search_ba(term, place, radius)
+                all_jobs.extend(items)
+                collected += len(items)
+                if include_remote:
+                    remote_items = search_ba(term, place, radius, homeoffice=True)
+                    all_jobs.extend(remote_items)
+                    collected += len(remote_items)
+            except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+                failures.append(f"{term}: {type(exc).__name__}")
+        reports.append(f"Arbeitsagentur: {collected} Treffer vor Dublettenabgleich" +
+                       (f" · Fehler: {', '.join(failures)}" if failures else ""))
+    if use_arbeitnow:
+        try:
+            items = search_arbeitnow(terms, place, nearby, include_remote)
+            all_jobs.extend(items)
+            reports.append(f"Arbeitnow: {len(items)} Treffer aus maximal zwei Seiten")
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            reports.append(f"Arbeitnow nicht erreichbar ({type(exc).__name__})")
+    if use_adzuna:
+        app_id, app_key = secret("ADZUNA_APP_ID"), secret("ADZUNA_APP_KEY")
+        if not app_id or not app_key:
+            reports.append("Adzuna: nicht aktiv – API-Zugangsdaten fehlen in Secrets")
+        else:
+            collected = 0
+            for term in terms:
+                try:
+                    items = search_adzuna(term, place, radius, app_id, app_key)
+                    all_jobs.extend(items)
+                    collected += len(items)
+                except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+                    reports.append(f"Adzuna: Fehler bei '{term}' ({type(exc).__name__})")
+            reports.append(f"Adzuna: {collected} Treffer vor Dublettenabgleich")
+    unique = {}
+    for job in all_jobs:
+        key = job["key"]
+        if key not in unique:
+            unique[key] = job
+        else:
+            # Wenn eine Quelle einen besseren Link oder eine Beschreibung liefert, ergänzen.
+            prior = unique[key]
+            prior["source"] += f", {job['source']}" if job["source"] not in prior["source"] else ""
+            if not prior["description"] and job["description"]:
+                prior["description"] = job["description"]
+            if not prior["url"] and job["url"]:
+                prior["url"] = job["url"]
+            prior["remote"] = prior["remote"] or job["remote"]
+            if job["remote"] and not prior["remote_note"]:
+                prior["remote_note"] = job["remote_note"]
+    return list(unique.values()), reports
+
+
+def score(job, terms):
+    title = normalized(job["title"])
+    description = normalized(job["description"])
+    values = []
+    for term in terms:
+        norm = normalized(term)
+        words = [word for word in norm.split() if len(word) >= 4]
+        if not norm:
+            continue
+        if norm in title:
+            values.append(100)
+        elif any(w in title for w in words):
+            values.append(75)
+        elif norm in description or any(w in description for w in words):
+            values.append(35)
+        else:
+            values.append(10)
+    return max(values, default=0)
+
+
+# Optionale Zugriffssperre: in Streamlit Secrets APP_PASSWORD konfigurieren.
+# Für einen privaten Prototyp gedacht, keine vollwertige Mehrbenutzerverwaltung.
+app_password = secret("APP_PASSWORD")
+if app_password and not st.session_state.get("jobradar_authenticated", False):
+    st.title("🔐 JobRadar – Anmeldung")
+    with st.form("login"):
+        entered = st.text_input("App-Passwort", type="password")
+        if st.form_submit_button("Anmelden"):
+            if hmac.compare_digest(entered, app_password):
+                st.session_state["jobradar_authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Passwort nicht korrekt.")
+    st.stop()
+
+init_db()
+st.title("🔎 JobRadar")
+st.caption("Mehrere Stellenquellen durchsuchen · Dubletten erkennen · Bewerbungen vormerken")
+if not app_password:
+    st.warning("Keine Zugriffssperre eingerichtet: Auf einer öffentlichen Streamlit-App könnten andere Besucher dein Stellenarchiv sehen und verändern. Lege für persönliche Nutzung APP_PASSWORD in Streamlit Secrets fest.")
+st.info(
+    "Diese Version nutzt echte externe Stellendaten, aber durchsucht LinkedIn, Indeed, XING, "
+    "StepStone oder METAJob nicht direkt. Es gibt keine Vollständigkeitsgarantie. "
+    "Entfernungsfilter stammen teils von der jeweiligen Quelle."
+)
+
+with st.sidebar:
+    st.header("Daten & Backup")
+    st.warning(
+        "Die Merkliste liegt lokal in SQLite. Auf Streamlit Community Cloud kann diese Datei "
+        "bei Neustarts verloren gehen. Lade regelmäßig ein Backup herunter!"
+    )
+    st.download_button("⬇️ Alle Stellen & Status sichern (JSON)", data=export_backup(),
+                       file_name="jobradar_backup.json", mime="application/json", use_container_width=True)
+    upload = st.file_uploader("Backup wiederherstellen", type=["json"], help="Importiert Status und gespeicherte Stellen.")
+    if upload is not None and st.button("Backup importieren", use_container_width=True):
+        try:
+            count = restore_backup(upload.getvalue().decode("utf-8"))
+            st.success(f"{count} Einträge importiert.")
+            st.rerun()
+        except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
+            st.error(f"Import fehlgeschlagen: {exc}")
+    st.divider()
+    with st.expander("Adzuna optional aktivieren"):
+        st.markdown("Optional: In **Streamlit → App Settings → Secrets** eintragen:")
+        st.code('ADZUNA_APP_ID = "deine_id"\nADZUNA_APP_KEY = "dein_key"', language="toml")
+        st.caption("Ohne Zugangsdaten funktioniert die Suche weiterhin über die anderen Quellen.")
+
+with st.form("search_form"):
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        terms_input = st.text_input("Berufe / Suchbegriffe (durch Komma trennen)",
+                                    value="Ernährungswissenschaftler, Ökotrophologe, Medical Nutrition")
+        place = st.text_input("Ort", value="Bergkamen")
+    with col2:
+        radius = st.select_slider("Umkreis (km)", options=[10, 20, 30, 50, 75, 100], value=50)
+        include_remote = st.checkbox("Deutschlandweite Homeoffice-Treffer zusätzlich", value=True)
+    with st.expander("Suchquellen und Ortseinstellungen"):
+        b1, b2, b3 = st.columns(3)
+        use_ba = b1.checkbox("Arbeitsagentur", value=True)
+        use_arbeitnow = b2.checkbox("Arbeitnow", value=True)
+        use_adzuna = b3.checkbox("Adzuna (API-Key)", value=False)
+        nearby_input = st.text_input("Weitere Orte für Arbeitnow (kein exakter Radiusfilter)",
+                                    value="Kamen, Werne, Hamm, Dortmund, Lünen, Unna, Bönen, Selm")
+        st.caption("Arbeitsagentur/Adzuna: Radius wird der API übergeben. Arbeitnow: nur Ortsnamen-Abgleich; Entfernung nicht nachgemessen.")
+    submitted = st.form_submit_button("🔍 Jetzt live suchen", type="primary", use_container_width=True)
+
+if submitted:
+    terms = [x.strip() for x in terms_input.split(",") if x.strip()][:4]
+    nearby = [x.strip() for x in nearby_input.split(",") if x.strip()][:20]
+    if not terms:
+        st.error("Bitte mindestens einen Suchbegriff eingeben.")
+    elif not (use_ba or use_arbeitnow or use_adzuna):
+        st.error("Bitte mindestens eine Suchquelle wählen.")
+    else:
+        with st.spinner("Stellenquellen werden abgefragt …"):
+            jobs, reports = search_all(terms, place.strip(), radius, include_remote,
+                                       nearby, use_ba, use_arbeitnow, use_adzuna)
+            fresh = save_jobs(jobs)
+            jobs.sort(key=lambda j: (j["key"] not in fresh, -score(j, terms), j["title"]))
+            st.session_state["jobs"] = jobs
+            st.session_state["fresh"] = list(fresh)
+            st.session_state["reports"] = reports
+            st.session_state["terms"] = terms
+
+if "jobs" in st.session_state:
+    jobs = st.session_state["jobs"]
+    fresh = set(st.session_state.get("fresh", []))
+    statuses = {r["key"]: r["status"] for r in get_all()}
+    available = [j for j in jobs if statuses.get(j["key"], "Neu") not in CLOSED]
+    n_new = sum(j["key"] in fresh for j in available)
+    a, b, c = st.columns(3)
+    a.metric("Treffer, ohne Dubletten", len(jobs))
+    b.metric("Zum ersten Mal gefunden", len(fresh))
+    c.metric("Aktuell sichtbar (nicht erledigt)", len(available))
+    with st.expander("Quellenbericht"):
+        for report in st.session_state.get("reports", []):
+            st.write("• " + report)
+    if not jobs:
+        st.warning("Keine Treffer aus den abgefragten Quellen. Andere Begriffe oder größere Suche versuchen; eine Quelle kann vorübergehend ausfallen.")
+
+    t1, t2 = st.columns(2)
+    display_mode = t1.selectbox("Anzeigen", ["Alle offenen Treffer", "Nur neue aus diesem Suchlauf", "Merkliste", "Auch erledigte Stellen"])
+    title_filter = t2.text_input("Treffer zusätzlich filtern", placeholder="Titel oder Arbeitgeber")
+    shown = []
+    for job in jobs:
+        current = statuses.get(job["key"], "Neu")
+        if display_mode == "Alle offenen Treffer" and current in CLOSED:
+            continue
+        if display_mode == "Nur neue aus diesem Suchlauf" and (job["key"] not in fresh or current in CLOSED):
+            continue
+        if display_mode == "Merkliste" and current != "Merkliste":
+            continue
+        if title_filter and normalized(title_filter) not in normalized(job["title"] + " " + job["company"]):
+            continue
+        shown.append(job)
+
+    st.caption(f"{len(shown)} Treffer angezeigt. 'Neu' bezieht sich auf deine lokal gespeicherte Suchhistorie.")
+    for job in shown[:100]:
+        key = job["key"]
+        current = statuses.get(key, "Neu")
+        with st.container(border=True):
+            l, r = st.columns([4, 1])
+            with l:
+                st.subheader(job["title"])
+                st.write(f"**{job['company']}** · {job['location']}")
+                st.caption(f"Quelle: {job['source']}" + (" · 🆕 Erstmals gefunden" if key in fresh else ""))
+                if job.get("remote"):
+                    st.caption("🏠 " + (job.get("remote_note") or "Remote-Angabe der Quelle; Umfang prüfen"))
+                if job["description"]:
+                    with st.expander("Kurzbeschreibung"):
+                        st.write(job["description"][:900])
+            with r:
+                st.caption("Status: " + current)
+                if job["url"]:
+                    st.link_button("Anzeige öffnen", job["url"], use_container_width=True)
+            action = st.columns(3)
+            if action[0].button("⭐ Merken", key="save_" + key, use_container_width=True):
+                set_status(key, "Merkliste")
+                st.rerun()
+            if action[1].button("✅ Beworben", key="applied_" + key, use_container_width=True):
+                set_status(key, "Beworben")
+                st.rerun()
+            if action[2].button("🗃️ Ablegen", key="reject_" + key, use_container_width=True):
+                set_status(key, "Abgelegt")
+                st.rerun()
+            if current in CLOSED and st.button("↩️ Wieder öffnen", key="reopen_" + key):
+                set_status(key, "Neu")
+                st.rerun()
+
+st.divider()
+with st.expander("📚 Gespeichertes Archiv (auch nach einem Neustart der Oberfläche)"):
+    records = get_all()
+    st.caption(f"{len(records)} gespeicherte Datensätze in der aktuellen SQLite-Datei")
+    archive_filter = st.selectbox("Archivstatus", ["Alle", *STATUS_VALUES])
+    archived = [row for row in records if archive_filter == "Alle" or row["status"] == archive_filter]
+    for row in archived[:150]:
+        col1, col2 = st.columns([4, 1])
+        with col1:
+            st.write(f"**{row['title']}** — {row['company']} ({row['location']}) · {row['status']}")
+        with col2:
+            opts = STATUS_VALUES
+            selected = st.selectbox("Status ändern", opts, index=opts.index(row["status"]),
+                                    key="archive_status_" + row["key"], label_visibility="collapsed")
+            if selected != row["status"]:
+                set_status(row["key"], selected)
+                st.rerun()
+
+st.caption("JobRadar MVP · Manuelle Suche · Keine automatische Hintergrundüberwachung · Keine Garantie auf vollständige oder aktuelle Stellenabdeckung")
